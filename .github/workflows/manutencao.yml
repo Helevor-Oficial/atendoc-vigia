@@ -1,0 +1,25 @@
+# Num repositório público, o GitHub desliga o agendamento de um workflow depois
+# de 60 dias sem atividade. Um commit vazio por mês mantém o vigia ligado.
+
+name: manutencao
+
+on:
+  schedule:
+    - cron: "17 9 1 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  manter:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Commit vazio
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "Mantém o agendamento do vigia ligado"
+          git push
