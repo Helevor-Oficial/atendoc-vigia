@@ -1,4 +1,4 @@
-# Vigia de fora da Contabo (E00-H27): testa a produção a partir do GitHub.
+# Vigia de fora da Contabo (E00-H27): testa o Atendoc a partir do GitHub.
 #
 # É a segunda verificação, independente do Uptime Kuma: se a Contabo inteira
 # cair, ou a própria máquina do Teleport onde o Kuma roda, o Kuma não avisa, e
@@ -6,84 +6,224 @@
 # agendado falha (Settings > Notifications > Actions, "Only notify for failed
 # workflows").
 #
-# Cada alvo tem três tentativas, com 20 s entre elas, para oscilação de rede
-# não virar alarme. Também falha com certificado a menos de 14 dias de vencer.
+# Por que um laço longo e não um run a cada 5 minutos: o GitHub trata o
+# agendamento como "melhor esforço" e descarta disparos quando está cheio. Em
+# 14 e 15/10/2026, com o cron a cada 5 minutos, os runs saíram a cada 3 a 5
+# horas. Por isso cada run agendado fica no ar até 340 minutos e testa cada
+# alvo uma vez por minuto; o disparo seguinte do cron fica na fila (grupo de
+# concorrência) e começa assim que este termina. O repositório é público:
+# não gasta minutos de Actions da organização, mas ocupa um dos 20 jobs
+# simultâneos do plano Free enquanto roda.
 #
-# Roda a cada 5 minutos neste repositório público, que não gasta minutos de
-# Actions da organização. Num repositório público o GitHub desliga o
-# agendamento depois de 60 dias sem commit: o workflow manutencao faz um
-# commit vazio por mês para mantê-lo ligado.
-# Também roda à mão (Actions > vigia > Run workflow).
+# Alertas (valores de partida da E00-H27, ajustáveis):
+#   - fora do ar: 3 minutos seguidos sem resposta 2xx (limite de 15 s por
+#     tentativa). O alerta sai em cerca de 3 minutos depois do início da queda.
+#   - lento: 5 minutos seguidos com resposta acima de 3 s. O alerta sai ao fim
+#     do quinto minuto.
+#   - certificado a menos de 14 dias de vencer (lido no início e a cada hora).
+# Qualquer alerta encerra o run com falha, e a falha vira o e-mail.
+#
+# À mão (Actions > vigia > Run workflow), para conferir ou provar um alerta no
+# staging: "alvos" = staging, "limite_lento" baixo (ex.: 0.05) prova o alerta
+# de lentidão; "alvo_extra" com um endereço que responde 404 prova o de queda.
+#
+# Num repositório público o GitHub desliga o agendamento depois de 60 dias sem
+# commit: o workflow manutencao faz um commit vazio por mês para mantê-lo
+# ligado.
 
 name: vigia
 
 on:
   workflow_dispatch:
+    inputs:
+      minutos:
+        description: Quanto tempo o laço fica testando (minutos, até 340)
+        required: false
+        default: "15"
+      limite_lento:
+        description: Tempo de resposta (s) acima do qual o minuto conta como lento
+        required: false
+        default: "3"
+      alvos:
+        description: Quais alvos testar
+        required: false
+        default: todos
+        type: choice
+        options:
+          - todos
+          - staging
+      alvo_extra:
+        description: Endereço extra a testar (prova de queda; deixe vazio)
+        required: false
+        default: ""
   schedule:
     - cron: "*/5 * * * *"
 
 permissions:
   contents: read
 
+# O agendado e o manual não se esperam: o manual não fica horas atrás do laço.
+# Dentro de cada grupo, um roda e o seguinte espera.
 concurrency:
-  group: vigia
+  group: vigia-${{ github.event_name }}
   cancel-in-progress: false
 
 jobs:
   vigia:
     name: app, API e Teleport
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 355
+    env:
+      MINUTOS: ${{ inputs.minutos || '340' }}
+      LIMITE_LENTO: ${{ inputs.limite_lento || '3' }}
+      ALVOS: ${{ inputs.alvos || 'todos' }}
+      ALVO_EXTRA: ${{ inputs.alvo_extra || '' }}
     steps:
-      - name: Testar
+      - name: Testar a cada minuto
         run: |
-          alvos=(
-            "Produção · app|https://app.atendoc.com.br"
-            "Produção · API|https://api.atendoc.com.br/up"
-            "Teleport|https://acesso.atendoc.com.br/web/login"
+          # Sem -e: uma tentativa que falha não pode derrubar o laço.
+          set +e
+          set -uo pipefail
+          export TZ=America/Sao_Paulo
+          FALHAS_PARA_ALERTA=3
+          MINUTOS_LENTOS_PARA_ALERTA=5
+          DIAS_CERTIFICADO=14
+
+          if ! [[ "$MINUTOS" =~ ^[0-9]+$ ]] || [ "$MINUTOS" -lt 1 ] || [ "$MINUTOS" -gt 340 ]; then
+            echo "::error::minutos inválido: $MINUTOS (1 a 340)"; exit 2
+          fi
+          if ! [[ "$LIMITE_LENTO" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+            echo "::error::limite_lento inválido: $LIMITE_LENTO"; exit 2
+          fi
+
+          alvos=()
+          if [ "$ALVOS" = todos ]; then
+            alvos+=(
+              "Produção · app|https://app.atendoc.com.br"
+              "Produção · API|https://api.atendoc.com.br/saude"
+              "Teleport|https://acesso.atendoc.com.br/web/login"
+            )
+          fi
+          alvos+=(
             "Staging · app|https://app.staging.atendoc.com.br/entrar"
             "Staging · API|https://api.staging.atendoc.com.br/saude"
           )
-          falhas=0
-          {
-            echo "| Alvo | Resultado | Tempo | Certificado |"
-            echo "| --- | --- | --- | --- |"
-          } >> "$GITHUB_STEP_SUMMARY"
-          for alvo in "${alvos[@]}"; do
-            nome=${alvo%%|*}
-            url=${alvo#*|}
-            resultado="falhou"
-            tempo="-"
-            for tentativa in 1 2 3; do
-              if saida=$(curl -sS -o /dev/null -w '%{http_code} %{time_total}' --max-time 15 "$url" 2>&1) &&
-                [[ "$saida" =~ ^2[0-9][0-9]\  ]]; then
-                resultado="ok (${saida%% *})"
-                tempo="${saida#* }s"
-                break
-              fi
-              echo "::warning::$nome: tentativa $tentativa falhou ($saida)"
-              if [ "$tentativa" -lt 3 ]; then sleep 20; fi
-            done
-
-            host=${url#https://}
-            host=${host%%/*}
-            validade=$(echo | openssl s_client -connect "$host:443" -servername "$host" 2>/dev/null |
-              openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2 || true)
-            if [ -n "$validade" ]; then
-              dias=$(( ($(date -d "$validade" +%s) - $(date +%s)) / 86400 ))
-              certificado="$dias dias"
-              if [ "$dias" -lt 14 ]; then
-                echo "::error::$nome: certificado vence em $dias dias"
-                falhas=$((falhas + 1))
-              fi
-            else
-              certificado="sem leitura"
+          if [ -n "$ALVO_EXTRA" ]; then
+            if ! [[ "$ALVO_EXTRA" =~ ^https://[A-Za-z0-9.-]+\.atendoc\.com\.br(/[A-Za-z0-9._~/-]*)?$ ]]; then
+              echo "::error::alvo_extra precisa ser um endereço https em atendoc.com.br"; exit 2
             fi
+            alvos+=("Teste · alvo extra|$ALVO_EXTRA")
+          fi
 
-            if [ "$resultado" = "falhou" ]; then
-              echo "::error::$nome fora do ar: $url ($saida)"
-              falhas=$((falhas + 1))
-            fi
-            echo "| $nome | $resultado | $tempo | $certificado |" >> "$GITHUB_STEP_SUMMARY"
+          n=${#alvos[@]}
+          declare -a nomes urls falhas lentos total erros soma maior certificado ultimos
+          for ((i = 0; i < n; i++)); do
+            nomes[i]=${alvos[i]%%|*}
+            urls[i]=${alvos[i]#*|}
+            falhas[i]=0; lentos[i]=0; total[i]=0; erros[i]=0; soma[i]=0; maior[i]=0
+            certificado[i]="-"; ultimos[i]=""
           done
-          exit "$falhas"
+
+          alertas=()
+
+          conferir_certificados() {
+            local i host validade dias
+            for ((i = 0; i < n; i++)); do
+              host=${urls[i]#https://}
+              host=${host%%/*}
+              validade=$(echo | timeout 20 openssl s_client -connect "$host:443" -servername "$host" 2>/dev/null |
+                openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2 || true)
+              if [ -z "$validade" ]; then
+                certificado[i]="sem leitura"
+                continue
+              fi
+              dias=$(( ($(date -d "$validade" +%s) - $(date +%s)) / 86400 ))
+              certificado[i]="$dias dias"
+              if [ "$dias" -lt "$DIAS_CERTIFICADO" ]; then
+                alertas+=("${nomes[i]}: certificado vence em $dias dias")
+              fi
+            done
+          }
+
+          resumo() {
+            local i media
+            {
+              echo "### Vigia, $(date '+%d/%m/%Y %H:%M') (Brasília)"
+              echo
+              echo "Limites: fora do ar com $FALHAS_PARA_ALERTA minutos seguidos sem 2xx; lento com $MINUTOS_LENTOS_PARA_ALERTA minutos seguidos acima de ${LIMITE_LENTO} s."
+              echo
+              echo "| Alvo | Testes | Sem 2xx | Tempo médio | Maior tempo | Certificado |"
+              echo "| --- | --- | --- | --- | --- | --- |"
+              for ((i = 0; i < n; i++)); do
+                media=$(awk -v s="${soma[i]}" -v t="${total[i]}" -v e="${erros[i]}" \
+                  'BEGIN { ok = t - e; if (ok > 0) printf "%.2f s", s / ok; else print "-" }')
+                echo "| ${nomes[i]} | ${total[i]} | ${erros[i]} | $media | ${maior[i]} s | ${certificado[i]} |"
+              done
+              if [ "${#alertas[@]}" -gt 0 ]; then
+                echo
+                echo "**Alerta**"
+                echo
+                for ((i = 0; i < ${#alertas[@]}; i++)); do echo "- ${alertas[i]}"; done
+                echo
+                echo "Últimos testes de cada alvo (hora, código, tempo):"
+                echo
+                for ((i = 0; i < n; i++)); do echo "- ${nomes[i]}:${ultimos[i]}"; done
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          conferir_certificados
+          fim=$(( $(date +%s) + MINUTOS * 60 ))
+          rodada=0
+          echo "Testando ${n} alvos a cada minuto por ${MINUTOS} minutos (até $(date -d "@$fim" '+%H:%M'))."
+
+          while [ "${#alertas[@]}" -eq 0 ] && [ "$(date +%s)" -lt "$fim" ]; do
+            inicio=$(date +%s)
+            rodada=$((rodada + 1))
+            if [ $((rodada % 60)) -eq 0 ]; then conferir_certificados; fi
+            linha="$(date '+%H:%M')"
+            for ((i = 0; i < n; i++)); do
+              saida=$(curl -sS -o /dev/null -w '%{http_code} %{time_total}' --max-time 15 "${urls[i]}" 2>&1)
+              codigo=${saida%% *}
+              tempo=${saida##* }
+              total[i]=$(( total[i] + 1 ))
+              if [[ "$codigo" =~ ^2[0-9][0-9]$ ]] && [[ "$tempo" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+                falhas[i]=0
+                soma[i]=$(awk -v a="${soma[i]}" -v b="$tempo" 'BEGIN { print a + b }')
+                maior[i]=$(awk -v a="${maior[i]}" -v b="$tempo" 'BEGIN { printf "%.2f", (b > a ? b : a) }')
+                if awk -v t="$tempo" -v l="$LIMITE_LENTO" 'BEGIN { exit !(t > l) }'; then
+                  lentos[i]=$(( lentos[i] + 1 ))
+                else
+                  lentos[i]=0
+                fi
+                marca=$(printf '%s %.2fs' "$codigo" "$tempo")
+              else
+                falhas[i]=$(( falhas[i] + 1 ))
+                erros[i]=$(( erros[i] + 1 ))
+                lentos[i]=0
+                marca="falhou (${saida//$'\n'/ })"
+                echo "::warning::${nomes[i]}: sem resposta 2xx (${saida//$'\n'/ }), ${falhas[i]}º minuto seguido"
+              fi
+              # Guarda só os cinco últimos testes, para o resumo do alerta.
+              ultimos[i]=$(awk -F' ; ' '{ s = ""; for (k = (NF > 5 ? NF - 4 : 2); k <= NF; k++) s = s " ; " $k; print s }' \
+                <<<"${ultimos[i]} ; $(date '+%H:%M') ${marca}")
+              linha="$linha | ${nomes[i]} ${marca}"
+              if [ "${falhas[i]}" -ge "$FALHAS_PARA_ALERTA" ]; then
+                alertas+=("${nomes[i]} fora do ar: ${falhas[i]} minutos seguidos sem resposta 2xx (${urls[i]})")
+              fi
+              if [ "${lentos[i]}" -ge "$MINUTOS_LENTOS_PARA_ALERTA" ]; then
+                alertas+=("${nomes[i]} lento: ${lentos[i]} minutos seguidos acima de ${LIMITE_LENTO} s (${urls[i]})")
+              fi
+            done
+            echo "$linha"
+            [ "${#alertas[@]}" -gt 0 ] && break
+            espera=$(( inicio + 60 - $(date +%s) ))
+            [ "$espera" -gt 0 ] && sleep "$espera"
+          done
+
+          resumo
+          if [ "${#alertas[@]}" -gt 0 ]; then
+            for ((i = 0; i < ${#alertas[@]}; i++)); do echo "::error title=Atendoc::${alertas[i]}"; done
+            exit 1
+          fi
+          echo "Sem alerta em ${rodada} rodadas."
