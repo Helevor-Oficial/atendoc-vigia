@@ -21,6 +21,12 @@
 #   - lento: 5 minutos seguidos com resposta acima de 3 s. O alerta sai ao fim
 #     do quinto minuto.
 #   - certificado a menos de 14 dias de vencer (lido no início e a cada hora).
+#   - armazenamento de arquivos: 15 minutos seguidos com o /saude em 503 só
+#     pelo armazenamento (MSF-617). O /saude diz no JSON qual parte não
+#     respondeu; o armazenamento da Contabo fica sem resposta por minutos
+#     seguidos de madrugada (MSF-510), sem a API estar fora do ar. Esse minuto
+#     vira aviso no resumo e não conta para o "fora do ar" (nem o zera). 503 com
+#     o banco ou a fila sem resposta, ou sem o JSON, é "fora do ar".
 # Qualquer alerta encerra o run com falha, e a falha vira o e-mail.
 #
 # À mão (Actions > vigia > Run workflow), para conferir ou provar um alerta no
@@ -88,6 +94,7 @@ jobs:
           FALHAS_PARA_ALERTA=3
           MINUTOS_LENTOS_PARA_ALERTA=5
           DIAS_CERTIFICADO=14
+          MINUTOS_ARMAZENAMENTO_PARA_ALERTA=15
 
           if ! [[ "$MINUTOS" =~ ^[0-9]+$ ]] || [ "$MINUTOS" -lt 1 ] || [ "$MINUTOS" -gt 340 ]; then
             echo "::error::minutos inválido: $MINUTOS (1 a 340)"; exit 2
@@ -120,14 +127,26 @@ jobs:
 
           n=${#alvos[@]}
           declare -a nomes urls falhas lentos total erros soma maior certificado ultimos
+          declare -a armazenamento so_armazenamento
           for ((i = 0; i < n; i++)); do
             nomes[i]=${alvos[i]%%|*}
             urls[i]=${alvos[i]#*|}
             falhas[i]=0; lentos[i]=0; total[i]=0; erros[i]=0; soma[i]=0; maior[i]=0
             certificado[i]="-"; ultimos[i]=""
+            armazenamento[i]=0; so_armazenamento[i]=0
           done
 
           alertas=()
+          corpo=$(mktemp)
+
+          # 503 do /saude com só o armazenamento de arquivos sem resposta, o
+          # banco e a fila respondendo (o JSON do SaudeControlador do back).
+          so_o_armazenamento() {
+            [[ "$1" == */saude ]] && [ "$2" = 503 ] &&
+              grep -Eq '"armazenamento" *: *"sem resposta"' "$corpo" &&
+              grep -Eq '"banco" *: *"responde"' "$corpo" &&
+              grep -Eq '"fila" *: *"responde"' "$corpo"
+          }
 
           conferir_certificados() {
             local i host validade dias
@@ -155,12 +174,18 @@ jobs:
               echo
               echo "Limites: fora do ar com $FALHAS_PARA_ALERTA minutos seguidos sem 2xx; lento com $MINUTOS_LENTOS_PARA_ALERTA minutos seguidos acima de ${LIMITE_LENTO} s."
               echo
-              echo "| Alvo | Testes | Sem 2xx | Tempo médio | Maior tempo | Certificado |"
-              echo "| --- | --- | --- | --- | --- | --- |"
+              echo "| Alvo | Testes | Sem 2xx | Só o armazenamento | Tempo médio | Maior tempo | Certificado |"
+              echo "| --- | --- | --- | --- | --- | --- | --- |"
               for ((i = 0; i < n; i++)); do
-                media=$(awk -v s="${soma[i]}" -v t="${total[i]}" -v e="${erros[i]}" \
-                  'BEGIN { ok = t - e; if (ok > 0) printf "%.2f s", s / ok; else print "-" }')
-                echo "| ${nomes[i]} | ${total[i]} | ${erros[i]} | $media | ${maior[i]} s | ${certificado[i]} |"
+                media=$(awk -v s="${soma[i]}" -v t="${total[i]}" -v e="${erros[i]}" -v a="${so_armazenamento[i]}" \
+                  'BEGIN { ok = t - e - a; if (ok > 0) printf "%.2f s", s / ok; else print "-" }')
+                echo "| ${nomes[i]} | ${total[i]} | ${erros[i]} | ${so_armazenamento[i]} | $media | ${maior[i]} s | ${certificado[i]} |"
+              done
+              for ((i = 0; i < n; i++)); do
+                if [ "${so_armazenamento[i]}" -gt 0 ]; then
+                  echo
+                  echo "**Aviso:** ${nomes[i]} respondeu 503 só pelo armazenamento de arquivos em ${so_armazenamento[i]} minuto(s); não conta como fora do ar. O alarme do armazenamento sai com $MINUTOS_ARMAZENAMENTO_PARA_ALERTA minutos seguidos."
+                fi
               done
               if [ "${#alertas[@]}" -gt 0 ]; then
                 echo
@@ -186,12 +211,14 @@ jobs:
             if [ $((rodada % 60)) -eq 0 ]; then conferir_certificados; fi
             linha="$(date '+%H:%M')"
             for ((i = 0; i < n; i++)); do
-              saida=$(curl -sS -o /dev/null -w '%{http_code} %{time_total}' --max-time 15 "${urls[i]}" 2>&1)
+              : > "$corpo"
+              saida=$(curl -sS -o "$corpo" -w '%{http_code} %{time_total}' --max-time 15 "${urls[i]}" 2>&1)
               codigo=${saida%% *}
               tempo=${saida##* }
               total[i]=$(( total[i] + 1 ))
               if [[ "$codigo" =~ ^2[0-9][0-9]$ ]] && [[ "$tempo" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
                 falhas[i]=0
+                armazenamento[i]=0
                 soma[i]=$(awk -v a="${soma[i]}" -v b="$tempo" 'BEGIN { print a + b }')
                 maior[i]=$(awk -v a="${maior[i]}" -v b="$tempo" 'BEGIN { printf "%.2f", (b > a ? b : a) }')
                 if awk -v t="$tempo" -v l="$LIMITE_LENTO" 'BEGIN { exit !(t > l) }'; then
@@ -200,6 +227,12 @@ jobs:
                   lentos[i]=0
                 fi
                 marca=$(printf '%s %.2fs' "$codigo" "$tempo")
+              elif so_o_armazenamento "${urls[i]}" "$codigo"; then
+                armazenamento[i]=$(( armazenamento[i] + 1 ))
+                so_armazenamento[i]=$(( so_armazenamento[i] + 1 ))
+                lentos[i]=0
+                marca="503 só o armazenamento"
+                echo "::warning::${nomes[i]}: 503 só com o armazenamento de arquivos sem resposta, ${armazenamento[i]}º minuto seguido (não conta como fora do ar)"
               else
                 falhas[i]=$(( falhas[i] + 1 ))
                 erros[i]=$(( erros[i] + 1 ))
@@ -216,6 +249,9 @@ jobs:
               fi
               if [ "${lentos[i]}" -ge "$MINUTOS_LENTOS_PARA_ALERTA" ]; then
                 alertas+=("${nomes[i]} lento: ${lentos[i]} minutos seguidos acima de ${LIMITE_LENTO} s (${urls[i]})")
+              fi
+              if [ "${armazenamento[i]}" -ge "$MINUTOS_ARMAZENAMENTO_PARA_ALERTA" ]; then
+                alertas+=("${nomes[i]}: armazenamento de arquivos sem resposta há ${armazenamento[i]} minutos seguidos (${urls[i]})")
               fi
             done
             echo "$linha"
