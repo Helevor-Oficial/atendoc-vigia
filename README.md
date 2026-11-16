@@ -20,3 +20,9 @@ Actions > vigia > Run workflow, com `alvos` = `staging`:
 - queda: `alvo_extra` = um endereço do staging que responde 404 (por exemplo `https://api.staging.atendoc.com.br/nao-existe`). O run falha no terceiro minuto.
 
 O e-mail da falha de um run manual vai para quem o disparou.
+
+## Testar sem sair para a internet
+
+`bash teste/rodar.sh` roda o script do workflow contra um servidor HTTPS local que imita as respostas do Atendoc (`teste/servidor.py`, com Python 3), sem pedido para a produção nem para o staging. Leva uns 3 minutos e cobre cinco cenários: as respostas de hoje (sem alarme), queda com 502, tela sem resposta, redirecionamento para outro lugar e certificado perto de vencer (todos com alarme). `bash teste/rodar.sh -w <arquivo>` testa outro workflow com o mesmo formato, como o `vigia.yml` manual do `atendoc-gitops`.
+
+A tela é testada pela página de entrada, `/entrar`, e só resposta 2xx conta como no ar. A raiz responde 307 para `/entrar` desde 22/10/2026, e o vigia testava a raiz: de 22/10 a 16/11, toda rodada terminou com alarme falso no terceiro minuto (MSF-615).

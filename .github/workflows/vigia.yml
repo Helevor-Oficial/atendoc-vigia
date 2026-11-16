@@ -98,8 +98,11 @@ jobs:
 
           alvos=()
           if [ "$ALVOS" = todos ]; then
+            # A tela é testada pela página de entrada: a raiz responde 307 para
+            # /entrar desde 22/10/2026, e redirecionamento não conta como no ar
+            # (MSF-615). O staging já era testado assim.
             alvos+=(
-              "Produção · app|https://app.atendoc.com.br"
+              "Produção · app|https://app.atendoc.com.br/entrar"
               "Produção · API|https://api.atendoc.com.br/saude"
               "Teleport|https://acesso.atendoc.com.br/web/login"
             )
