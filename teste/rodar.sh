@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Testes do vigia sem sair para a internet (MSF-615).
+# Testes do vigia sem sair para a internet (MSF-615 e MSF-617).
 #
 # Tira do workflow o script do passo que testa (o bloco "run: |") e roda esse
 # script contra um servidor HTTPS local que imita as respostas do Atendoc
@@ -12,16 +12,23 @@
 #   teste/rodar.sh hoje queda-502       só alguns cenários
 #   teste/rodar.sh -w outro/vigia.yml   outro workflow com o mesmo formato
 #                                       (o vigia.yml manual do atendoc-gitops)
+#   PORTA_BASE=19443 teste/rodar.sh     outras portas locais (uma por cenário)
 #
 # O laço espera 1 minuto entre as rodadas, como no GitHub: o teste inteiro
 # leva uns 3 minutos.
 #
-# Cenários (só a tela da produção muda; os outros alvos respondem como hoje):
+# Cenários (só a tela ou o /saude da produção mudam; o resto responde como hoje):
 #   hoje                     / redireciona (307) para /entrar, que responde 200: sem alarme
 #   queda-502                a tela responde 502: alarme da tela em até 3 minutos
 #   sem-resposta             a tela não responde em 15 s: alarme da tela em até 3 minutos
 #   redirecionamento-errado  a tela redireciona para outro lugar: alarme (3xx não conta como no ar)
 #   certificado              certificado a 5 dias de vencer: alarme de certificado
+#   armazenamento-503        /saude 503 só com o armazenamento sem resposta: aviso, sem alarme
+#   armazenamento-limiar     o mesmo, com o limiar do armazenamento baixado de 15 para 2
+#                            minutos no script: alarme próprio do armazenamento (só no
+#                            vigia em laço, o que usa MINUTOS)
+#   banco-503                /saude 503 com o banco sem resposta: alarme da API em até 3 minutos
+#   saude-sem-json           /saude 503 sem o JSON (o proxy sem a API): alarme da API em até 3 minutos
 
 set -uo pipefail
 
@@ -32,9 +39,6 @@ if [ "${1:-}" = "-w" ]; then
   shift 2
 fi
 cenarios=("$@")
-if [ "${#cenarios[@]}" -eq 0 ]; then
-  cenarios=(hoje queda-502 sem-resposta redirecionamento-errado certificado)
-fi
 LIMITE_ALARME=180
 
 py=""
@@ -74,15 +78,34 @@ for i, linha in enumerate(linhas):
 sys.exit("sem bloco 'run: |' no workflow")
 PY
 
+# Vigia em laço (o agendado) ou de uma passada só (o manual do gitops).
+laco=""
+grep -q 'MINUTOS' "$trabalho/vigia.sh" && laco=1
+if [ "${#cenarios[@]}" -eq 0 ]; then
+  cenarios=(hoje queda-502 sem-resposta redirecionamento-errado certificado
+    armazenamento-503 banco-503 saude-sem-json)
+  [ -n "$laco" ] && cenarios+=(armazenamento-limiar)
+fi
+
 rodar_cenario() {
   local cenario=$1 porta=$2
   local dir="$trabalho/$cenario"
   mkdir -p "$dir/bin"
 
-  local dias=365 cenario_servidor=$cenario
+  local dias=365 cenario_servidor=$cenario script="$trabalho/vigia.sh"
   if [ "$cenario" = certificado ]; then
     dias=5
     cenario_servidor=hoje
+  fi
+  if [ "$cenario" = armazenamento-limiar ]; then
+    cenario_servidor=armazenamento-503
+    script="$dir/vigia.sh"
+    if ! grep -q '^MINUTOS_ARMAZENAMENTO_PARA_ALERTA=15$' "$trabalho/vigia.sh"; then
+      printf '%s\tfalhou\t-\t-\to workflow não tem o limiar do armazenamento (MINUTOS_ARMAZENAMENTO_PARA_ALERTA=15)\n' \
+        "$cenario" >"$dir/veredito"
+      return
+    fi
+    sed 's/^MINUTOS_ARMAZENAMENTO_PARA_ALERTA=15$/MINUTOS_ARMAZENAMENTO_PARA_ALERTA=2/' "$trabalho/vigia.sh" >"$script"
   fi
   # MSYS2_ARG_CONV_EXCL: no Git Bash do Windows, o "/CN=" não vira caminho.
   MSYS2_ARG_CONV_EXCL="/CN=" "$openssl_real" req -x509 -newkey rsa:2048 -nodes -days "$dias" \
@@ -91,6 +114,8 @@ rodar_cenario() {
   PYTHONIOENCODING=utf-8 "$py" "$aqui/servidor.py" "$porta" "$dir/certificado.pem" "$dir/chave.pem" \
     "$cenario_servidor" >"$dir/servidor.log" 2>&1 &
   local pid_servidor=$!
+  # shellcheck disable=SC2064 # o pid é o de agora, de propósito
+  trap "kill $pid_servidor 2>/dev/null" EXIT
   local pronto=""
   for _ in $(seq 150); do
     if grep -q "^pronto" "$dir/servidor.log" 2>/dev/null; then
@@ -130,7 +155,7 @@ EOF
   (
     cd "$dir" &&
       PATH="$dir/bin:$PATH" MINUTOS=3 LIMITE_LENTO=3 ALVOS=todos ALVO_EXTRA="" \
-        GITHUB_STEP_SUMMARY="$dir/resumo.md" bash -e "$trabalho/vigia.sh" >"$dir/saida.log" 2>&1
+        GITHUB_STEP_SUMMARY="$dir/resumo.md" bash -e "$script" >"$dir/saida.log" 2>&1
   )
   codigo=$?
   duracao=$(($(date +%s) - inicio))
@@ -154,10 +179,35 @@ EOF
         motivo="sem alarme de certificado (saída $codigo)"
       fi
       ;;
-    *)
-      if [ "$codigo" -eq 0 ] || ! grep -q '::error.*Produção · app fora do ar' "$dir/saida.log"; then
+    armazenamento-503)
+      if [ "$codigo" -ne 0 ] || [ -n "$alarme" ]; then
         resultado=falhou
-        motivo="queda sem alarme da tela (saída $codigo): ${alarme:-sem ::error}"
+        motivo="alarme pelo armazenamento (saída $codigo): ${alarme:-sem ::error}"
+      elif ! grep -q '::warning::.*Produção · API.*armazenamento' "$dir/saida.log"; then
+        resultado=falhou
+        motivo="sem aviso do armazenamento"
+      elif ! grep -q "^api.atendoc.com.br /saude 503$" "$dir/servidor.log"; then
+        resultado=falhou
+        motivo="o vigia não chegou a ler o /saude da produção"
+      else
+        alarme=$(grep -m1 '::warning::.*Produção · API.*armazenamento' "$dir/saida.log")
+      fi
+      ;;
+    armazenamento-limiar)
+      if [ "$codigo" -eq 0 ] || ! grep -q '::error.*Produção · API.*armazenamento' "$dir/saida.log"; then
+        resultado=falhou
+        motivo="sem alarme do armazenamento (saída $codigo): ${alarme:-sem ::error}"
+      elif grep -q '::error.*Produção · API fora do ar' "$dir/saida.log"; then
+        resultado=falhou
+        motivo="o armazenamento virou API fora do ar"
+      fi
+      ;;
+    *)
+      local alvo="Produção · app"
+      case $cenario in banco-503 | saude-sem-json) alvo="Produção · API" ;; esac
+      if [ "$codigo" -eq 0 ] || ! grep -q "::error.*$alvo fora do ar" "$dir/saida.log"; then
+        resultado=falhou
+        motivo="queda sem alarme de $alvo (saída $codigo): ${alarme:-sem ::error}"
       elif [ "$duracao" -gt "$LIMITE_ALARME" ]; then
         resultado=falhou
         motivo="alarme só depois de $duracao s"
@@ -170,10 +220,11 @@ EOF
 
 echo "Workflow: $workflow"
 echo "Cenários: ${cenarios[*]} (em paralelo, uns 3 minutos)"
-porta=18443
+porta=${PORTA_BASE:-18443}
 for cenario in "${cenarios[@]}"; do
   case $cenario in
     hoje | queda-502 | sem-resposta | redirecionamento-errado | certificado) ;;
+    armazenamento-503 | armazenamento-limiar | banco-503 | saude-sem-json) ;;
     *) echo "cenário desconhecido: $cenario"; exit 2 ;;
   esac
   rodar_cenario "$cenario" "$porta" &
